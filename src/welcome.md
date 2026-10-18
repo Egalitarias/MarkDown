@@ -38,3 +38,20 @@ int main() { std::cout << "Hello, world!\n"; }
 
 - [x] Render markdown
 - [ ] Write something great
+
+<div align="center">
+
+**Raw HTML blocks** work too, safely filtered.
+
+<img src="https://placehold.co/160x40?text=HTML+img" alt="placeholder" width="160">
+
+</div>
+
+<details>
+<summary>Footnotes and details</summary>
+
+Footnotes are supported.[^1] They can be referenced more than once.[^1]
+
+</details>
+
+[^1]: Here is the footnote, rendered at the bottom with a back-link.

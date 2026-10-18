@@ -10,3 +10,7 @@ Open local files or URLs, live reload, outline, find, dark mode, export to HTML,
 3. Run `build.bat` -> `build\MarkdownViewer.exe`.
 
 `index.html` is an earlier browser-only version.
+
+## Tests
+
+`testsuild_test.bat` builds a CLI renderer; `python tests/run_spec.py` runs it against the CommonMark examples (download `spec.json` from https://spec.commonmark.org/0.31.2/spec.json into `tests/`).

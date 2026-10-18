@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstring>
 #include <map>
+#include <set>
 #include <regex>
 #include <vector>
 
@@ -204,8 +205,153 @@ string SafeUrl(string url, bool image, const string& imageBase) {
     return out;
 }
 
-const char* kAllowedTags[] = {"br", "kbd", "sub", "sup", "b", "i", "u", "em", "strong", "mark", "details",
-                              "summary", "del", "ins", "small", "p", "center", "hr", "s"};
+
+struct Tag {
+    bool ok = false, closing = false, selfClose = false;
+    string name;
+    vector<std::pair<string, string>> attrs;
+    size_t end = 0;
+};
+
+Tag ParseTag(const string& s, size_t i) {
+    Tag t;
+    size_t n = s.size();
+    if (i >= n || s[i] != '<') return t;
+    size_t p = i + 1;
+    if (p < n && s[p] == '/') { t.closing = true; p++; }
+    size_t b = p;
+    if (p >= n || !isalpha((unsigned char)s[p])) return t;
+    while (p < n && (isalnum((unsigned char)s[p]) || s[p] == '-')) p++;
+    t.name = Lower(s.substr(b, p - b));
+    while (true) {
+        while (p < n && isspace((unsigned char)s[p])) p++;
+        if (p >= n) return t;
+        if (s[p] == '>') { p++; break; }
+        if (s[p] == '/' && p + 1 < n && s[p + 1] == '>') { t.selfClose = true; p += 2; break; }
+        if (t.closing) return t;
+        size_t a = p;
+        while (p < n && !isspace((unsigned char)s[p]) && s[p] != '=' && s[p] != '>' && s[p] != '/') p++;
+        if (p == a) return t;
+        string an = Lower(s.substr(a, p - a)), av;
+        size_t q = p;
+        while (q < n && isspace((unsigned char)s[q])) q++;
+        if (q < n && s[q] == '=') {
+            q++;
+            while (q < n && isspace((unsigned char)s[q])) q++;
+            if (q < n && (s[q] == '"' || s[q] == '\'')) {
+                size_t e = s.find(s[q], q + 1);
+                if (e == string::npos) return t;
+                av = s.substr(q + 1, e - q - 1);
+                q = e + 1;
+            } else {
+                size_t e = q;
+                while (e < n && !isspace((unsigned char)s[e]) && s[e] != '>') e++;
+                av = s.substr(q, e - q);
+                q = e;
+            }
+            p = q;
+        }
+        t.attrs.push_back({an, av});
+    }
+    t.ok = true;
+    t.end = p;
+    return t;
+}
+
+bool TagAllowed(const string& name) {
+    static const std::set<string> ok = {
+        "a", "abbr", "b", "blockquote", "br", "caption", "center", "cite", "code", "col", "colgroup", "dd", "del",
+        "details", "div", "dl", "dt", "em", "figcaption", "figure", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i",
+        "img", "ins", "kbd", "li", "mark", "ol", "p", "picture", "pre", "q", "s", "samp", "small", "source", "span",
+        "strike", "strong", "sub", "summary", "sup", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "tt", "u",
+        "ul", "var", "section", "article", "aside", "header", "footer", "nav", "main", "address"};
+    return ok.count(name) > 0;
+}
+
+string SanitizeSrcset(const string& v, const string& imageBase) {
+    string out;
+    size_t i = 0;
+    while (i <= v.size()) {
+        size_t e = v.find(',', i);
+        if (e == string::npos) e = v.size();
+        string cand = Trim(v.substr(i, e - i));
+        if (!cand.empty()) {
+            size_t sp = cand.find_first_of(" \t\r\n");
+            string url = cand.substr(0, sp), desc = sp == string::npos ? "" : Trim(cand.substr(sp));
+            if (!out.empty()) out += ", ";
+            out += SafeUrl(url, true, imageBase) + (desc.empty() ? "" : " " + desc);
+        }
+        i = e + 1;
+    }
+    return out;
+}
+
+string SanitizeTag(const Tag& t, const string& imageBase) {
+    if (t.closing) return "</" + t.name + ">";
+    static const std::set<string> plain = {"align", "valign", "width", "height", "alt", "title", "id", "name", "colspan",
+                                           "rowspan", "open", "start", "border", "lang", "dir"};
+    bool img = t.name == "img" || t.name == "source";
+    string o = "<" + t.name;
+    for (auto& kv : t.attrs) {
+        const string& k = kv.first;
+        const string& v = kv.second;
+        if (k == "href" && t.name == "a") o += " href=\"" + Esc(SafeUrl(v, false, imageBase)) + "\"";
+        else if (k == "src" && img) o += " src=\"" + Esc(SafeUrl(v, true, imageBase)) + "\"";
+        else if (k == "srcset" && img) o += " srcset=\"" + Esc(SanitizeSrcset(v, imageBase)) + "\"";
+        else if (k == "media" && t.name == "source") o += " media=\"" + Esc(v) + "\"";
+        else if (plain.count(k)) o += " " + k + "=\"" + Esc(v) + "\"";
+    }
+    return o + ">";
+}
+
+// Sanitises a chunk of raw HTML: allowed tags keep safe attributes, everything else is escaped.
+string SanitizeHtml(const string& h, const string& imageBase) {
+    string out;
+    size_t n = h.size();
+    for (size_t i = 0; i < n;) {
+        char c = h[i];
+        if (c == '<') {
+            if (StartsWith(h, i, "<!--")) {
+                size_t e = h.find("-->", i + 4);
+                i = e == string::npos ? n : e + 3;
+                continue;
+            }
+            Tag t = ParseTag(h, i);
+            if (t.ok && TagAllowed(t.name)) { out += SanitizeTag(t, imageBase); i = t.end; continue; }
+            out += "&lt;"; i++;
+        } else if (c == '>') { out += "&gt;"; i++; }
+        else if (c == '&') {
+            size_t e = i + 1;
+            while (e < n && e - i < 10 && (isalnum((unsigned char)h[e]) || h[e] == '#')) e++;
+            out += (e < n && h[e] == ';' && e > i + 1) ? "&" : "&amp;";
+            i++;
+        } else { out += c; i++; }
+    }
+    return out;
+}
+
+// 1 = comment, 2 = <pre>, 6 = block-level tag, 7 = a lone allowed tag on its line, 0 = not an HTML block
+int HtmlBlockKind(const string& l) {
+    size_t p = Indent(l);
+    if (p > 3 || p >= l.size() || l[p] != '<') return 0;
+    if (StartsWith(l, p, "<!--")) return 1;
+    size_t q = p + 1;
+    if (q < l.size() && l[q] == '/') q++;
+    size_t b = q;
+    while (q < l.size() && (isalnum((unsigned char)l[q]) || l[q] == '-')) q++;
+    if (q == b) return 0;
+    string name = Lower(l.substr(b, q - b));
+    if (q < l.size() && !isspace((unsigned char)l[q]) && l[q] != '>' && l[q] != '/') return 0;
+    static const std::set<string> blocks = {
+        "address", "article", "aside", "blockquote", "center", "dd", "details", "div", "dl", "dt", "figcaption", "figure",
+        "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "section",
+        "summary", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul"};
+    if (name == "pre" && l[p + 1] != '/') return 2;
+    if (blocks.count(name)) return 6;
+    Tag t = ParseTag(l, p);
+    if (t.ok && TagAllowed(t.name) && IsBlank(l.substr(t.end))) return 7;
+    return 0;
+}
 
 class Renderer {
 public:
@@ -235,18 +381,29 @@ public:
             }
         }
         lines = ExtractRefs(lines);
-        return Blocks(lines, false);
+        string body = Blocks(lines, false);
+        return body + RenderFootnotes();
     }
 
 private:
     string imageBase_;
     std::map<string, std::pair<string, string>> refs_;
 
+    struct Foot {
+        vector<string> lines;
+        int num = 0, refs = 0;
+    };
+    std::map<string, Foot> foot_;
+    vector<string> footOrder_;
+
+    // Removes link reference definitions and footnote definitions from the line list.
     vector<string> ExtractRefs(const vector<string>& in) {
         static const std::regex re(R"re(^ {0,3}\[([^\]\^][^\]]*)\]:\s*(<[^>]*>|\S+)(?:\s+(?:"([^"]*)"|'([^']*)'|\(([^)]*)\)))?\s*$)re");
+        static const std::regex fre(R"re(^ {0,3}\[\^([^\]\s]+)\]:\s?(.*)$)re");
         vector<string> out;
-        char fch = 0; size_t fn = 0; string info;
-        for (const auto& l : in) {
+        char fch = 0; size_t fn = 0;
+        for (size_t i = 0; i < in.size(); i++) {
+            const string& l = in[i];
             char c; size_t n; string inf;
             if (fch) {
                 if (IsFence(l, c, n, inf) && c == fch && n >= fn && inf.empty()) fch = 0;
@@ -255,6 +412,24 @@ private:
             }
             if (IsFence(l, c, n, inf)) { fch = c; fn = n; out.push_back(l); continue; }
             std::smatch m;
+            if (std::regex_match(l, m, fre)) {
+                Foot f;
+                f.lines.push_back(m[2].str());
+                size_t j = i + 1;
+                while (j < in.size()) {
+                    if (IsBlank(in[j])) {
+                        size_t k = j;
+                        while (k < in.size() && IsBlank(in[k])) k++;
+                        if (k < in.size() && Indent(in[k]) >= 2) { for (; j < k; j++) f.lines.push_back(""); continue; }
+                        break;
+                    }
+                    if (Indent(in[j]) >= 2) { f.lines.push_back(in[j].substr(std::min<size_t>(4, Indent(in[j])))); j++; continue; }
+                    break;
+                }
+                foot_.emplace(NormLabel(m[1].str()), std::move(f));
+                i = j - 1;
+                continue;
+            }
             if (std::regex_match(l, m, re)) {
                 string url = m[2].str();
                 if (url.size() >= 2 && url.front() == '<' && url.back() == '>') url = url.substr(1, url.size() - 2);
@@ -267,11 +442,33 @@ private:
         return out;
     }
 
+    string RenderFootnotes() {
+        vector<string> bodies;
+        for (size_t k = 0; k < footOrder_.size(); k++)  // bodies may reference further footnotes, growing the list
+            bodies.push_back(Blocks(foot_[footOrder_[k]].lines, false));
+        if (bodies.empty()) return "";
+        string out = "<section class=\"footnotes\">\n<hr>\n<ol>\n";
+        for (size_t k = 0; k < bodies.size(); k++) {
+            const Foot& f = foot_[footOrder_[k]];
+            string num = std::to_string(f.num), back;
+            for (int r = 1; r <= f.refs; r++) {
+                string id = "fnref-" + num + (r > 1 ? "-" + std::to_string(r) : "");
+                back += " <a class=\"fn-back\" href=\"#" + id + "\">\xE2\x86\xA9" + (r > 1 ? "<sup>" + std::to_string(r) + "</sup>" : "") + "</a>";
+            }
+            string& h = bodies[k];
+            size_t p = h.rfind("</p>");
+            if (p != string::npos) h.insert(p, back); else h += "<p>" + back + "</p>\n";
+            out += "<li id=\"fn-" + num + "\">\n" + h + "</li>\n";
+        }
+        return out + "</ol>\n</section>\n";
+    }
+
     static bool BlockStart(const string& l) {
         char c; size_t n; string inf; int lv; string t;
         if (IsFence(l, c, n, inf) || IsAtx(l, lv, t) || IsQuote(l) || IsHr(l)) return true;
+        { int hk = HtmlBlockKind(l); if (hk && hk != 7) return true; }
         Marker m = ParseMarker(l);
-        if (m.ok && !IsBlank(l.substr(m.content)) && (!m.ordered || m.start == 1)) return true;
+        if (m.ok && m.content < l.size() && !IsBlank(l.substr(m.content)) && (!m.ordered || m.start == 1)) return true;
         return false;
     }
 
@@ -309,6 +506,20 @@ private:
                 continue;
             }
             if (IsHr(l)) { out += "<hr>\n"; i++; continue; }
+
+            if (int hk = HtmlBlockKind(l)) {
+                string raw;
+                while (i < n) {
+                    raw += lines[i] + "\n";
+                    bool endNow = (hk == 1 && lines[i].find("-->") != string::npos) ||
+                                  (hk == 2 && Lower(lines[i]).find("</pre>") != string::npos);
+                    i++;
+                    if (endNow) break;
+                    if (hk >= 6 && (i >= n || IsBlank(lines[i]))) break;
+                }
+                out += SanitizeHtml(raw, imageBase_) + "\n";
+                continue;
+            }
 
             if (IsQuote(l)) {
                 vector<string> inner;
@@ -444,7 +655,7 @@ private:
                     if (Indent(lines[j]) >= cont) {
                         for (size_t k = i; k < j; k++) item.push_back("");
                         // blank line followed by a non-list paragraph line makes the list loose
-                        if (!ParseMarker(lines[j].substr(cont)).ok) loose = true;
+                        if (Indent(lines[j]) < cont + 2) loose = true;  // a direct child block after a blank line
                         i = j;
                         continue;
                     }
@@ -617,6 +828,22 @@ private:
                     continue;
                 }
             }
+            if (c == '[' && i + 1 < n && s[i + 1] == '^') {
+                size_t e = s.find(']', i + 2);
+                if (e != string::npos) {
+                    auto it = foot_.find(NormLabel(s.substr(i + 2, e - i - 2)));
+                    if (it != foot_.end()) {
+                        Foot& f = it->second;
+                        if (!f.num) { footOrder_.push_back(it->first); f.num = (int)footOrder_.size(); }
+                        f.refs++;
+                        string num = std::to_string(f.num);
+                        string id = "fnref-" + num + (f.refs > 1 ? "-" + std::to_string(f.refs) : "");
+                        out += "<sup class=\"fn-ref\"><a id=\"" + id + "\" href=\"#fn-" + num + "\">" + num + "</a></sup>";
+                        i = e + 1;
+                        continue;
+                    }
+                }
+            }
             if (c == '[') {
                 string text, url, title; size_t end;
                 if (ParseLink(s, i, noAuto, text, url, title, end)) {
@@ -627,6 +854,14 @@ private:
                 }
             }
             if (c == '<') {
+                if (StartsWith(s, i, "<!--")) {
+                    size_t ce = s.find("-->", i + 4);
+                    if (ce != string::npos) { i = ce + 3; continue; }
+                }
+                {
+                    Tag t = ParseTag(s, i);
+                    if (t.ok && TagAllowed(t.name)) { out += SanitizeTag(t, imageBase_); i = t.end; continue; }
+                }
                 size_t e = s.find('>', i);
                 if (e != string::npos) {
                     string inner = s.substr(i + 1, e - i - 1);
@@ -640,13 +875,6 @@ private:
                         out += "<a href=\"mailto:" + Esc(inner) + "\">" + Esc(inner) + "</a>";
                         i = e + 1; continue;
                     }
-                    string name = Lower(inner);
-                    if (!name.empty() && name[0] == '/') name.erase(0, 1);
-                    if (!name.empty() && name.back() == '/') name.pop_back();
-                    name = Trim(name);
-                    bool ok = false;
-                    for (auto t : kAllowedTags) if (name == t) ok = true;
-                    if (ok) { out += "<" + Lower(inner) + ">"; i = e + 1; continue; }
                 }
                 out += "&lt;"; i++; continue;
             }

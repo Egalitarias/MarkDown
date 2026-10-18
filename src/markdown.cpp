@@ -1090,10 +1090,16 @@ private:
                 size_t e = s.find('>', i);
                 if (e != string::npos) {
                     string inner = s.substr(i + 1, e - i - 1);
-                    static const std::regex url(R"(^(https?://[^\s<>]+|mailto:[^\s<>]+)$)", std::regex::icase);
+                    static const std::regex url(R"(^[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*$)");
                     static const std::regex mail(R"(^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$)");
-                    if (std::regex_match(inner, url)) {
-                        out += "<a href=\"" + Esc(inner) + "\">" + Esc(inner) + "</a>";
+                    string scheme = Lower(inner.substr(0, inner.find(':')));
+                    if (std::regex_match(inner, url) && scheme != "javascript" && scheme != "data" && scheme != "vbscript" && scheme != "file") {
+                        string href;
+                        for (char ch : inner) {
+                            if (strchr("\\[]`^{|}", ch)) { char buf[4]; snprintf(buf, sizeof buf, "%%%02X", (unsigned char)ch); href += buf; }
+                            else href += ch;
+                        }
+                        out += "<a href=\"" + Esc(href) + "\">" + Esc(inner) + "</a>";
                         i = e + 1; continue;
                     }
                     if (std::regex_match(inner, mail)) {

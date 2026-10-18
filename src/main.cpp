@@ -426,8 +426,9 @@ void OpenLink(const std::wstring& href) {
         DWORD n = 4096;
         if (SUCCEEDED(UrlCombineW(g_url.c_str(), href.c_str(), out, &n, 0))) {
             std::wstring u = out, p = u.substr(0, u.find_first_of(L"?#"));
-            if (IsMarkdownFile(p)) LoadUrl(u);
-            else ShellExecuteW(g_hwnd, L"open", u.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            bool web = _wcsnicmp(u.c_str(), L"http://", 7) == 0 || _wcsnicmp(u.c_str(), L"https://", 8) == 0;
+            if (web && IsMarkdownFile(p)) LoadUrl(u);
+            else if (web) ShellExecuteW(g_hwnd, L"open", u.c_str(), nullptr, nullptr, SW_SHOWNORMAL);  // never hand other schemes to the shell
         }
         return;
     }

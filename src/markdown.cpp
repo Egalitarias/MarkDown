@@ -206,6 +206,18 @@ string SafeUrl(string url, bool image, const string& imageBase) {
 }
 
 
+bool DecodeEntity(const string& s, size_t i, string& out, size_t& end);
+
+string DecodeEntities(const string& v) {
+    string o;
+    for (size_t i = 0; i < v.size();) {
+        string dec; size_t e;
+        if (v[i] == '&' && DecodeEntity(v, i, dec, e)) { o += dec; i = e; continue; }
+        o += v[i++];
+    }
+    return o;
+}
+
 struct Tag {
     bool ok = false, closing = false, selfClose = false;
     string name;
@@ -224,14 +236,16 @@ Tag ParseTag(const string& s, size_t i) {
     while (p < n && (isalnum((unsigned char)s[p]) || s[p] == '-')) p++;
     t.name = Lower(s.substr(b, p - b));
     while (true) {
+        size_t wsStart = p;
         while (p < n && isspace((unsigned char)s[p])) p++;
+        bool ws = p > wsStart;
         if (p >= n) return t;
         if (s[p] == '>') { p++; break; }
         if (s[p] == '/' && p + 1 < n && s[p + 1] == '>') { t.selfClose = true; p += 2; break; }
-        if (t.closing) return t;
+        if (t.closing || !ws) return t;
         size_t a = p;
-        while (p < n && !isspace((unsigned char)s[p]) && s[p] != '=' && s[p] != '>' && s[p] != '/') p++;
-        if (p == a) return t;
+        if (!(isalpha((unsigned char)s[p]) || s[p] == '_' || s[p] == ':')) return t;
+        while (p < n && (isalnum((unsigned char)s[p]) || s[p] == '_' || s[p] == '.' || s[p] == ':' || s[p] == '-')) p++;
         string an = Lower(s.substr(a, p - a)), av;
         size_t q = p;
         while (q < n && isspace((unsigned char)s[q])) q++;
@@ -245,7 +259,8 @@ Tag ParseTag(const string& s, size_t i) {
                 q = e + 1;
             } else {
                 size_t e = q;
-                while (e < n && !isspace((unsigned char)s[e]) && s[e] != '>') e++;
+                while (e < n && !isspace((unsigned char)s[e]) && !strchr("\"'=<>`", s[e])) e++;
+                if (e == q) return t;
                 av = s.substr(q, e - q);
                 q = e;
             }
@@ -294,7 +309,7 @@ string SanitizeTag(const Tag& t, const string& imageBase) {
     string o = "<" + t.name;
     for (auto& kv : t.attrs) {
         const string& k = kv.first;
-        const string& v = kv.second;
+        const string v = DecodeEntities(kv.second);
         if (k == "href" && t.name == "a") o += " href=\"" + Esc(SafeUrl(v, false, imageBase)) + "\"";
         else if (k == "src" && img) o += " src=\"" + Esc(SafeUrl(v, true, imageBase)) + "\"";
         else if (k == "srcset" && img) o += " srcset=\"" + Esc(SanitizeSrcset(v, imageBase)) + "\"";

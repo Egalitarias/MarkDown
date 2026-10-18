@@ -354,6 +354,161 @@ int HtmlBlockKind(const string& l) {
 }
 
 
+void AppendUtf8(string& o, unsigned long cp) {
+    if (cp < 0x80) o += (char)cp;
+    else if (cp < 0x800) { o += (char)(0xC0 | (cp >> 6)); o += (char)(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) { o += (char)(0xE0 | (cp >> 12)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
+    else { o += (char)(0xF0 | (cp >> 18)); o += (char)(0x80 | ((cp >> 12) & 0x3F)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
+}
+
+// Decodes an HTML character reference at s[i] ('&'). Returns false if it is not a known reference.
+bool DecodeEntity(const string& s, size_t i, string& out, size_t& end) {
+    static const std::map<string, unsigned long> names = {
+        {"amp", 38}, {"lt", 60}, {"gt", 62}, {"quot", 34}, {"apos", 39}, {"nbsp", 160}, {"iexcl", 161}, {"cent", 162},
+        {"pound", 163}, {"curren", 164}, {"yen", 165}, {"brvbar", 166}, {"sect", 167}, {"uml", 168}, {"copy", 169},
+        {"ordf", 170}, {"laquo", 171}, {"not", 172}, {"shy", 173}, {"reg", 174}, {"macr", 175}, {"deg", 176},
+        {"plusmn", 177}, {"sup2", 178}, {"sup3", 179}, {"acute", 180}, {"micro", 181}, {"para", 182}, {"middot", 183},
+        {"cedil", 184}, {"sup1", 185}, {"ordm", 186}, {"raquo", 187}, {"frac14", 188}, {"frac12", 189}, {"frac34", 190},
+        {"iquest", 191}, {"times", 215}, {"divide", 247}, {"Auml", 196}, {"Ouml", 214}, {"Uuml", 220}, {"auml", 228},
+        {"ouml", 246}, {"uuml", 252}, {"szlig", 223}, {"eacute", 233}, {"egrave", 232}, {"agrave", 224}, {"aacute", 225},
+        {"ccedil", 231}, {"ntilde", 241}, {"oacute", 243}, {"iacute", 237}, {"uacute", 250}, {"Eacute", 201},
+        {"ndash", 8211}, {"mdash", 8212}, {"lsquo", 8216}, {"rsquo", 8217}, {"sbquo", 8218}, {"ldquo", 8220},
+        {"rdquo", 8221}, {"bdquo", 8222}, {"dagger", 8224}, {"Dagger", 8225}, {"bull", 8226}, {"hellip", 8230},
+        {"permil", 8240}, {"prime", 8242}, {"Prime", 8243}, {"lsaquo", 8249}, {"rsaquo", 8250}, {"euro", 8364},
+        {"trade", 8482}, {"larr", 8592}, {"uarr", 8593}, {"rarr", 8594}, {"darr", 8595}, {"harr", 8596},
+        {"lArr", 8656}, {"rArr", 8658}, {"hArr", 8660}, {"forall", 8704}, {"part", 8706}, {"exist", 8707},
+        {"empty", 8709}, {"nabla", 8711}, {"isin", 8712}, {"sum", 8721}, {"minus", 8722}, {"radic", 8730},
+        {"infin", 8734}, {"and", 8743}, {"or", 8744}, {"cap", 8745}, {"cup", 8746}, {"int", 8747}, {"asymp", 8776},
+        {"ne", 8800}, {"equiv", 8801}, {"le", 8804}, {"ge", 8805}, {"hearts", 9829}, {"spades", 9824},
+        {"clubs", 9827}, {"diams", 9830}, {"alpha", 945}, {"beta", 946}, {"gamma", 947}, {"delta", 948},
+        {"epsilon", 949}, {"lambda", 955}, {"mu", 956}, {"pi", 960}, {"sigma", 963}, {"omega", 969}, {"Omega", 937},
+        {"Delta", 916}, {"Sigma", 931}, {"ensp", 8194}, {"emsp", 8195}, {"thinsp", 8201}, {"check", 10003},
+        {"Dcaron", 270}, {"HilbertSpace", 8459}, {"DifferentialD", 8518}, {"ClockwiseContourIntegral", 8754}};
+    size_t n = s.size(), p = i + 1;
+    if (p < n && s[p] == '#') {
+        p++;
+        bool hex = p < n && (s[p] == 'x' || s[p] == 'X');
+        if (hex) p++;
+        size_t b = p;
+        while (p < n && (hex ? isxdigit((unsigned char)s[p]) : isdigit((unsigned char)s[p])) && p - b < 9) p++;
+        size_t digits = p - b;
+        if (!digits || digits > (hex ? 6u : 7u) || p >= n || s[p] != ';') return false;
+        unsigned long cp = strtoul(s.substr(b, digits).c_str(), nullptr, hex ? 16 : 10);
+        if (cp == 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+        AppendUtf8(out, cp);
+        end = p + 1;
+        return true;
+    }
+    size_t b = p;
+    while (p < n && isalnum((unsigned char)s[p]) && p - b < 32) p++;
+    if (p == b || p >= n || s[p] != ';') return false;
+    auto it = names.find(s.substr(b, p - b));
+    if (it == names.end()) return false;
+    AppendUtf8(out, it->second);
+    end = p + 1;
+    return true;
+}
+
+// Resolves backslash escapes and character references (used for link destinations and titles).
+string Unescape(const string& s) {
+    string o;
+    for (size_t i = 0; i < s.size();) {
+        if (s[i] == '\\' && i + 1 < s.size() && ispunct((unsigned char)s[i + 1])) { o += s[i + 1]; i += 2; continue; }
+        if (s[i] == '&') {
+            string dec; size_t e;
+            if (DecodeEntity(s, i, dec, e)) { o += dec; i = e; continue; }
+        }
+        o += s[i++];
+    }
+    return o;
+}
+
+// Parses a link reference definition at lines[i]; returns the number of lines it spans (0 if there is none).
+size_t ParseRefDef(const vector<string>& lines, size_t i, string& label, string& url, string& title) {
+    size_t end = i;
+    string text;
+    vector<size_t> starts;
+    while (end < lines.size() && !IsBlank(lines[end])) {
+        starts.push_back(text.size());
+        text += lines[end] + "\n";
+        end++;
+    }
+    auto lineOf = [&](size_t pos) {
+        size_t k = 0;
+        while (k + 1 < starts.size() && starts[k + 1] <= pos) k++;
+        return k;
+    };
+    size_t p = 0, n = text.size(), ind = 0;
+    while (p < n && text[p] == ' ' && ind < 3) { p++; ind++; }
+    if (p >= n || text[p] != '[') return 0;
+    p++;
+    size_t lb = p;
+    while (p < n && text[p] != ']') {
+        if (text[p] == '\\' && p + 1 < n) p++;
+        else if (text[p] == '[') return 0;
+        p++;
+    }
+    if (p >= n) return 0;
+    label = text.substr(lb, p - lb);
+    if (IsBlank(label) || label.size() > 999) return 0;
+    p++;
+    if (p >= n || text[p] != ':') return 0;
+    p++;
+    while (p < n && isspace((unsigned char)text[p])) p++;
+    if (p >= n) return 0;
+    string dest;
+    if (text[p] == '<') {
+        p++;
+        size_t b = p;
+        while (p < n && text[p] != '>') {
+            if (text[p] == '\n' || text[p] == '<') return 0;
+            if (text[p] == '\\' && p + 1 < n) p++;
+            p++;
+        }
+        if (p >= n) return 0;
+        dest = text.substr(b, p - b);
+        p++;
+    } else {
+        size_t b = p;
+        int par = 0;
+        while (p < n && !isspace((unsigned char)text[p]) && !iscntrl((unsigned char)text[p])) {
+            if (text[p] == '\\' && p + 1 < n && ispunct((unsigned char)text[p + 1])) { p += 2; continue; }
+            if (text[p] == '(') par++;
+            else if (text[p] == ')') { if (par == 0) break; par--; }
+            p++;
+        }
+        if (p == b || par != 0) return 0;
+        dest = text.substr(b, p - b);
+    }
+    size_t eol = text.find('\n', p);
+    bool restBlank = IsBlank(text.substr(p, eol - p));
+    size_t defEnd = eol;
+    string t;
+    bool haveTitle = false;
+    size_t q = p;
+    bool sawSpace = false;
+    while (q < n && isspace((unsigned char)text[q])) { sawSpace = true; q++; }
+    if (sawSpace && q < n && (text[q] == '"' || text[q] == '\'' || text[q] == '(')) {
+        char open = text[q], close = open == '(' ? ')' : open;
+        size_t r = q + 1;
+        bool ok = false;
+        while (r < n) {
+            if (text[r] == '\\' && r + 1 < n) { r += 2; continue; }
+            if (text[r] == close) { ok = true; break; }
+            if (open == '(' && text[r] == '(') break;
+            r++;
+        }
+        if (ok) {
+            size_t e2 = text.find('\n', r + 1);
+            if (IsBlank(text.substr(r + 1, e2 - r - 1))) { t = text.substr(q + 1, r - q - 1); haveTitle = true; defEnd = e2; }
+        }
+    }
+    if (!haveTitle && !restBlank) return 0;
+    url = Unescape(dest);
+    title = Unescape(t);
+    return lineOf(defEnd) + 1;
+}
+
 struct Node {
     string text;                 // literal HTML for non-delimiters
     bool delim = false;
@@ -443,8 +598,11 @@ private:
         static const std::regex fre(R"re(^ {0,3}\[\^([^\]\s]+)\]:\s?(.*)$)re");
         vector<string> out;
         char fch = 0; size_t fn = 0;
+        bool lastWasDef = false;
         for (size_t i = 0; i < in.size(); i++) {
             const string& l = in[i];
+            bool afterDef = lastWasDef;
+            lastWasDef = false;
             char c; size_t n; string inf;
             if (fch) {
                 if (IsFence(l, c, n, inf) && c == fch && n >= fn && inf.empty()) fch = 0;
@@ -471,12 +629,15 @@ private:
                 i = j - 1;
                 continue;
             }
-            if (std::regex_match(l, m, re)) {
-                string url = m[2].str();
-                if (url.size() >= 2 && url.front() == '<' && url.back() == '>') url = url.substr(1, url.size() - 2);
-                string title = m[3].matched ? m[3].str() : m[4].matched ? m[4].str() : m[5].matched ? m[5].str() : "";
-                refs_.emplace(NormLabel(m[1].str()), std::make_pair(url, title));
-                continue;
+            if (afterDef || i == 0 || IsBlank(in[i - 1])) {
+                string lab, u, t;
+                size_t cnt = ParseRefDef(in, i, lab, u, t);
+                if (cnt) {
+                    refs_.emplace(NormLabel(lab), std::make_pair(u, t));
+                    i += cnt - 1;
+                    lastWasDef = true;
+                    continue;
+                }
             }
             out.push_back(l);
         }
@@ -799,7 +960,7 @@ private:
                 while (q < n && (s[q] == ' ' || s[q] == '\n')) q++;
             }
             if (q >= n || s[q] != ')') return false;
-            url = dest; title = t; end = q + 1;
+            url = Unescape(dest); title = Unescape(t); end = q + 1;
             return true;
         }
         string label;
@@ -961,7 +1122,11 @@ private:
                 i += r;
                 continue;
             }
-            if (c == '&') { out += "&amp;"; i++; continue; }
+            if (c == '&') {
+                string dec; size_t e;
+                if (DecodeEntity(s, i, dec, e)) { out += Esc(dec); i = e; continue; }
+                out += "&amp;"; i++; continue;
+            }
             if (c == '>') { out += "&gt;"; i++; continue; }
             if (c == '"') { out += "&quot;"; i++; continue; }
             out += c;

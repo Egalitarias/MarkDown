@@ -3,6 +3,8 @@
 Usage: python run_spec.py [spec.json] [--fails SECTION]
 spec.json: https://spec.commonmark.org/0.31.2/spec.json
 """
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
 import json, subprocess, sys, os, re, collections
 
 here = os.path.dirname(os.path.abspath(__file__))

@@ -1,5 +1,13 @@
 #include "markdown.h"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -59,6 +67,28 @@ string Lower(string s) {
     return s;
 }
 
+string LowerUnicode(const string& s) {
+#ifdef _WIN32
+    bool hi = false;
+    for (unsigned char c : s) if (c >= 0x80) { hi = true; break; }
+    if (hi) {
+        int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+        if (n > 0) {
+            std::wstring w(n, 0), l(n, 0);
+            MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+            int m = LCMapStringW(LOCALE_INVARIANT, LCMAP_LOWERCASE, w.data(), n, &l[0], n);
+            if (m > 0) {
+                int k = WideCharToMultiByte(CP_UTF8, 0, l.data(), m, nullptr, 0, nullptr, nullptr);
+                string o(k, 0);
+                WideCharToMultiByte(CP_UTF8, 0, l.data(), m, &o[0], k, nullptr, nullptr);
+                return o;
+            }
+        }
+    }
+#endif
+    return s;
+}
+
 string NormLabel(const string& s) {
     string o;
     bool sp = false;
@@ -68,7 +98,7 @@ string NormLabel(const string& s) {
         sp = false;
         o += (char)tolower((unsigned char)c);
     }
-    return o;
+    return LowerUnicode(o);
 }
 
 bool StartsWith(const string& s, size_t pos, const char* lit) {
@@ -411,27 +441,9 @@ void AppendUtf8(string& o, unsigned long cp) {
 
 // Decodes an HTML character reference at s[i] ('&'). Returns false if it is not a known reference.
 bool DecodeEntity(const string& s, size_t i, string& out, size_t& end) {
-    static const std::map<string, unsigned long> names = {
-        {"amp", 38}, {"lt", 60}, {"gt", 62}, {"quot", 34}, {"apos", 39}, {"nbsp", 160}, {"iexcl", 161}, {"cent", 162},
-        {"pound", 163}, {"curren", 164}, {"yen", 165}, {"brvbar", 166}, {"sect", 167}, {"uml", 168}, {"copy", 169},
-        {"ordf", 170}, {"laquo", 171}, {"not", 172}, {"shy", 173}, {"reg", 174}, {"macr", 175}, {"deg", 176},
-        {"plusmn", 177}, {"sup2", 178}, {"sup3", 179}, {"acute", 180}, {"micro", 181}, {"para", 182}, {"middot", 183},
-        {"cedil", 184}, {"sup1", 185}, {"ordm", 186}, {"raquo", 187}, {"frac14", 188}, {"frac12", 189}, {"frac34", 190},
-        {"iquest", 191}, {"times", 215}, {"divide", 247}, {"Auml", 196}, {"Ouml", 214}, {"Uuml", 220}, {"auml", 228},
-        {"ouml", 246}, {"uuml", 252}, {"szlig", 223}, {"eacute", 233}, {"egrave", 232}, {"agrave", 224}, {"aacute", 225},
-        {"ccedil", 231}, {"ntilde", 241}, {"oacute", 243}, {"iacute", 237}, {"uacute", 250}, {"Eacute", 201},
-        {"ndash", 8211}, {"mdash", 8212}, {"lsquo", 8216}, {"rsquo", 8217}, {"sbquo", 8218}, {"ldquo", 8220},
-        {"rdquo", 8221}, {"bdquo", 8222}, {"dagger", 8224}, {"Dagger", 8225}, {"bull", 8226}, {"hellip", 8230},
-        {"permil", 8240}, {"prime", 8242}, {"Prime", 8243}, {"lsaquo", 8249}, {"rsaquo", 8250}, {"euro", 8364},
-        {"trade", 8482}, {"larr", 8592}, {"uarr", 8593}, {"rarr", 8594}, {"darr", 8595}, {"harr", 8596},
-        {"lArr", 8656}, {"rArr", 8658}, {"hArr", 8660}, {"forall", 8704}, {"part", 8706}, {"exist", 8707},
-        {"empty", 8709}, {"nabla", 8711}, {"isin", 8712}, {"sum", 8721}, {"minus", 8722}, {"radic", 8730},
-        {"infin", 8734}, {"and", 8743}, {"or", 8744}, {"cap", 8745}, {"cup", 8746}, {"int", 8747}, {"asymp", 8776},
-        {"ne", 8800}, {"equiv", 8801}, {"le", 8804}, {"ge", 8805}, {"hearts", 9829}, {"spades", 9824},
-        {"clubs", 9827}, {"diams", 9830}, {"alpha", 945}, {"beta", 946}, {"gamma", 947}, {"delta", 948},
-        {"epsilon", 949}, {"lambda", 955}, {"mu", 956}, {"pi", 960}, {"sigma", 963}, {"omega", 969}, {"Omega", 937},
-        {"Delta", 916}, {"Sigma", 931}, {"ensp", 8194}, {"emsp", 8195}, {"thinsp", 8201}, {"check", 10003},
-        {"Dcaron", 270}, {"HilbertSpace", 8459}, {"DifferentialD", 8518}, {"ClockwiseContourIntegral", 8754}};
+    static const std::map<string, string> names = {
+#include "entities.inc"
+    };
     size_t n = s.size(), p = i + 1;
     if (p < n && s[p] == '#') {
         p++;
@@ -452,7 +464,7 @@ bool DecodeEntity(const string& s, size_t i, string& out, size_t& end) {
     if (p == b || p >= n || s[p] != ';') return false;
     auto it = names.find(s.substr(b, p - b));
     if (it == names.end()) return false;
-    AppendUtf8(out, it->second);
+    out += it->second;
     end = p + 1;
     return true;
 }
@@ -578,12 +590,79 @@ bool CanLazy(const vector<string>& v) {
     return true;
 }
 
+// Expands tabs in the leading whitespace (and after leading quote / list markers) to spaces by column.
+string NormalizeTabs(const string& l) {
+    string o;
+    size_t i = 0, col = 0;
+    auto ws = [&]() {
+        while (i < l.size() && (l[i] == ' ' || l[i] == '\t')) {
+            if (l[i] == '\t') { size_t nc = (col / 4 + 1) * 4; o.append(nc - col, ' '); col = nc; }
+            else { o += ' '; col++; }
+            i++;
+        }
+    };
+    ws();
+    for (int guard = 0; guard < 6; guard++) {
+        if (i < l.size() && l[i] == '>') { o += '>'; col++; i++; ws(); continue; }
+        size_t m = i;
+        if (m < l.size() && (l[m] == '-' || l[m] == '+' || l[m] == '*')) m++;
+        else {
+            size_t d = m;
+            while (d < l.size() && isdigit((unsigned char)l[d])) d++;
+            if (d > m && d - m <= 9 && d < l.size() && (l[d] == '.' || l[d] == ')')) m = d + 1;
+            else break;
+        }
+        if (m < l.size() && (l[m] == ' ' || l[m] == '\t')) { o.append(l, i, m - i); col += m - i; i = m; ws(); continue; }
+        break;
+    }
+    o.append(l, i, string::npos);
+    return o;
+}
+
+// Unicode-aware character classes for emphasis flanking rules.
+unsigned long CpAt(const string& s, size_t i) {
+    unsigned char c = (unsigned char)s[i];
+    if (c < 0x80) return c;
+    int len = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+    if (len == 1 || i + len > s.size()) return c;
+    unsigned long cp = c & (0x3F >> (len - 1));
+    for (int k = 1; k < len; k++) cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3F);
+    return cp;
+}
+
+unsigned long CpBefore(const string& s, size_t i) {
+    size_t j = i;
+    while (j > 0 && ((unsigned char)s[j - 1] & 0xC0) == 0x80 && i - j < 3) j--;
+    return j > 0 ? CpAt(s, j - 1) : ' ';
+}
+
+bool IsUniSpace(unsigned long x) {
+    return x == ' ' || x == '\n' || x == '\t' || x == '\r' || x == '\f' || x == '\v' || x == 0xA0 || x == 0x1680 ||
+           (x >= 0x2000 && x <= 0x200A) || x == 0x202F || x == 0x205F || x == 0x3000;
+}
+
+bool IsUniPunct(unsigned long x) {
+    if (x < 128) return ispunct((int)x) != 0;
+    if (x < 0x100) return (x >= 0xA1 && x <= 0xA9) || (x >= 0xAB && x <= 0xB1) || x == 0xB4 || (x >= 0xB6 && x <= 0xB8) || x == 0xBB || x == 0xBF || x == 0xD7 || x == 0xF7;
+    return (x >= 0x2010 && x <= 0x2027) || (x >= 0x2030 && x <= 0x205E) || (x >= 0x20A0 && x <= 0x20C0) ||
+           (x >= 0x2190 && x <= 0x2BFF) || (x >= 0x3001 && x <= 0x3003) || (x >= 0x3008 && x <= 0x3011) ||
+           (x >= 0x3014 && x <= 0x301F) || (x >= 0xFF01 && x <= 0xFF0F) || (x >= 0xFF1A && x <= 0xFF20) || (x >= 0xFF3B && x <= 0xFF40) ||
+           (x >= 0xFF5B && x <= 0xFF65);
+}
+
+// A link reference definition may follow a blank line, a heading, a rule, or another definition.
+bool CanStartDef(const vector<string>& in, size_t i, bool afterDef) {
+    if (afterDef || i == 0 || IsBlank(in[i - 1]) || IsHr(in[i - 1])) return true;
+    int lv; string t;
+    return IsAtx(in[i - 1], lv, t);
+}
+
 struct Node {
     string text;                 // literal HTML for non-delimiters
     bool delim = false;
     char ch = 0;
     int count = 0, orig = 0;     // remaining / original run length
-    bool open = false, close = false;
+    bool open = false, close = false, done = false;
     string before, after;        // markup emitted around the remaining literal delimiter chars
 };
 
@@ -591,7 +670,7 @@ struct Node {
 void ProcessEmphasis(vector<Node>& nodes) {
     for (size_t c = 0; c < nodes.size(); c++) {
         if (!nodes[c].delim || !nodes[c].close) continue;
-        while (nodes[c].count > 0 && nodes[c].close) {
+        while (nodes[c].count > 0 && nodes[c].close && !nodes[c].done) {
             size_t o = c;
             bool found = false;
             while (o-- > 0) {
@@ -603,7 +682,7 @@ void ProcessEmphasis(vector<Node>& nodes) {
                 found = true;
                 break;
             }
-            if (!found) { nodes[c].close = false; break; }
+            if (!found) { nodes[c].done = true; break; }
             Node& op = nodes[o];
             Node& cl = nodes[c];
             int use = op.ch == '~' ? op.count : (op.count >= 2 && cl.count >= 2 ? 2 : 1);
@@ -637,15 +716,7 @@ public:
         if (!lines.empty() && lines[0].size() >= 3 && (unsigned char)lines[0][0] == 0xEF && (unsigned char)lines[0][1] == 0xBB && (unsigned char)lines[0][2] == 0xBF)
             lines[0].erase(0, 3);
         if (lines.size() > 1 && lines.back().empty()) lines.pop_back();
-        for (auto& l : lines) {  // expand leading tabs
-            size_t t = 0;
-            while (t < l.size() && (l[t] == '\t' || l[t] == ' ')) t++;
-            if (l.find('\t') < t) {
-                string lead;
-                for (size_t k = 0; k < t; k++) lead += (l[k] == '\t') ? string("    ") : string(" ");
-                l = lead + l.substr(t);
-            }
-        }
+        for (auto& l : lines) if (l.find('\t') != string::npos) l = NormalizeTabs(l);
         lines = ExtractRefs(lines);
         string body = Blocks(lines, false);
         return body + RenderFootnotes();
@@ -699,7 +770,7 @@ private:
                 i = j - 1;
                 continue;
             }
-            if (afterDef || i == 0 || IsBlank(in[i - 1])) {
+            if (CanStartDef(in, i, afterDef)) {
                 string lab, u, t;
                 size_t cnt = ParseRefDef(in, i, lab, u, t);
                 if (cnt) {
@@ -771,7 +842,7 @@ private:
                 }
                 string lang = info.substr(0, info.find_first_of(" \t{"));
                 out += "<pre><code";
-                if (!lang.empty()) out += " class=\"language-" + Esc(lang) + "\"";
+                if (!lang.empty()) out += " class=\"language-" + Esc(Unescape(lang)) + "\"";
                 out += ">" + Esc(code) + "</code></pre>\n";
                 continue;
             }
@@ -1215,10 +1286,10 @@ private:
             if (c == '*' || c == '_' || c == '~') {
                 size_t r = 0;
                 while (i + r < n && s[i + r] == c) r++;
-                unsigned char prev = i > 0 ? (unsigned char)s[i - 1] : ' ';
-                unsigned char next = i + r < n ? (unsigned char)s[i + r] : ' ';
-                auto isSp = [](unsigned char x) { return x == 1 || x == ' ' || x == '\n' || x == '\t' || x == '\r' || x == '\f' || x == '\v'; };
-                auto isPu = [](unsigned char x) { return x < 128 && ispunct(x); };
+                unsigned long prev = i > 0 ? CpBefore(s, i) : ' ';
+                unsigned long next = i + r < n ? CpAt(s, i + r) : ' ';
+                auto isSp = [](unsigned long x) { return x == 1 || IsUniSpace(x); };
+                auto isPu = [](unsigned long x) { return IsUniPunct(x); };
                 bool leftFlank = !isSp(next) && (!isPu(next) || isSp(prev) || isPu(prev));
                 bool rightFlank = !isSp(prev) && (!isPu(prev) || isSp(next) || isPu(next));
                 Node d;

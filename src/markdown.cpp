@@ -353,6 +353,47 @@ int HtmlBlockKind(const string& l) {
     return 0;
 }
 
+
+struct Node {
+    string text;                 // literal HTML for non-delimiters
+    bool delim = false;
+    char ch = 0;
+    int count = 0, orig = 0;     // remaining / original run length
+    bool open = false, close = false;
+    string before, after;        // markup emitted around the remaining literal delimiter chars
+};
+
+// CommonMark "process emphasis": pairs up delimiter runs and records the tags to emit.
+void ProcessEmphasis(vector<Node>& nodes) {
+    for (size_t c = 0; c < nodes.size(); c++) {
+        if (!nodes[c].delim || !nodes[c].close) continue;
+        while (nodes[c].count > 0 && nodes[c].close) {
+            size_t o = c;
+            bool found = false;
+            while (o-- > 0) {
+                Node& op = nodes[o];
+                if (!op.delim || !op.open || op.count == 0 || op.ch != nodes[c].ch) continue;
+                if (op.ch == '~') { if (op.count != nodes[c].count) continue; }
+                else if ((nodes[c].open || op.close) && (op.orig + nodes[c].orig) % 3 == 0 &&
+                         !(op.orig % 3 == 0 && nodes[c].orig % 3 == 0)) continue;
+                found = true;
+                break;
+            }
+            if (!found) { nodes[c].close = false; break; }
+            Node& op = nodes[o];
+            Node& cl = nodes[c];
+            int use = op.ch == '~' ? op.count : (op.count >= 2 && cl.count >= 2 ? 2 : 1);
+            const char* tag = op.ch == '~' ? "del" : use == 2 ? "strong" : "em";
+            op.after = string("<") + tag + ">" + op.after;
+            cl.before += string("</") + tag + ">";
+            op.count -= use;
+            cl.count -= use;
+            for (size_t k = o + 1; k < c; k++) nodes[k].open = nodes[k].close = false;  // delimiters in between become literal
+            if (op.count == 0) op.open = false;
+        }
+    }
+}
+
 class Renderer {
 public:
     explicit Renderer(string imageBase) : imageBase_(std::move(imageBase)) {}
@@ -782,6 +823,14 @@ private:
     string Inline(const string& s, bool noAuto) {
         string out;
         size_t n = s.size(), i = 0;
+        vector<Node> nodes;
+        auto flush = [&]() {
+            if (out.empty()) return;
+            Node t;
+            t.text = std::move(out);
+            out.clear();
+            nodes.push_back(std::move(t));
+        };
         while (i < n) {
             char c = s[i];
 
@@ -891,43 +940,24 @@ private:
             if (c == '*' || c == '_' || c == '~') {
                 size_t r = 0;
                 while (i + r < n && s[i + r] == c) r++;
-                bool valid = (c == '~') ? r == 2 : r <= 3;
-                bool leftFlank = i + r < n && !isspace((unsigned char)s[i + r]);
-                if (c == '_' && i > 0 && IsAlnum(s[i - 1])) leftFlank = false;
-                if (valid && leftFlank) {
-                    size_t j = i + r;
-                    bool found = false;
-                    while (j < n) {
-                        if (s[j] == '\\') { j += 2; continue; }
-                        if (s[j] == '`') {
-                            size_t k = j;
-                            while (k < n && s[k] == '`') k++;
-                            size_t f = s.find(s.substr(j, k - j), k);
-                            j = (f != string::npos) ? f + (k - j) : k;
-                            continue;
-                        }
-                        if (s[j] == c) {
-                            size_t rr = 0;
-                            while (j + rr < n && s[j + rr] == c) rr++;
-                            bool rightFlank = j > i + r && !isspace((unsigned char)s[j - 1]);
-                            if (c == '_' && j + rr < n && IsAlnum(s[j + rr])) rightFlank = false;
-                            if (rr == r && rightFlank) { found = true; break; }
-                            j += rr;
-                            continue;
-                        }
-                        j++;
-                    }
-                    if (found) {
-                        string inner = Inline(s.substr(i + r, j - i - r), noAuto);
-                        if (c == '~') out += "<del>" + inner + "</del>";
-                        else if (r == 1) out += "<em>" + inner + "</em>";
-                        else if (r == 2) out += "<strong>" + inner + "</strong>";
-                        else out += "<strong><em>" + inner + "</em></strong>";
-                        i = j + r;
-                        continue;
-                    }
+                unsigned char prev = i > 0 ? (unsigned char)s[i - 1] : ' ';
+                unsigned char next = i + r < n ? (unsigned char)s[i + r] : ' ';
+                auto isSp = [](unsigned char x) { return x == ' ' || x == '\n' || x == '\t' || x == '\r' || x == '\f' || x == '\v'; };
+                auto isPu = [](unsigned char x) { return x < 128 && ispunct(x); };
+                bool leftFlank = !isSp(next) && (!isPu(next) || isSp(prev) || isPu(prev));
+                bool rightFlank = !isSp(prev) && (!isPu(prev) || isSp(next) || isPu(next));
+                Node d;
+                d.delim = true; d.ch = c; d.count = d.orig = (int)r;
+                if (c == '_') {
+                    d.open = leftFlank && (!rightFlank || isPu(prev));
+                    d.close = rightFlank && (!leftFlank || isPu(next));
+                } else {
+                    d.open = leftFlank;
+                    d.close = rightFlank;
+                    if (c == '~' && r > 2) d.open = d.close = false;
                 }
-                out += string(r, c);
+                flush();
+                nodes.push_back(d);
                 i += r;
                 continue;
             }
@@ -937,7 +967,14 @@ private:
             out += c;
             i++;
         }
-        return out;
+        flush();
+        ProcessEmphasis(nodes);
+        string result;
+        for (auto& nd : nodes) {
+            if (!nd.delim) { result += nd.text; continue; }
+            result += nd.before + string(nd.count, nd.ch) + nd.after;
+        }
+        return result;
     }
 };
 

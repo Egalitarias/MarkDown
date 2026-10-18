@@ -557,6 +557,27 @@ size_t ParseRefDef(const vector<string>& lines, size_t i, string& label, string&
     return lineOf(defEnd) + 1;
 }
 
+// True if the last line of a container's content is paragraph text, so a following line may continue it lazily.
+bool CanLazy(const vector<string>& v) {
+    if (v.empty() || IsBlank(v.back())) return false;
+    char fch = 0; size_t fn = 0, chunk = 0;
+    for (size_t k = 0; k < v.size(); k++) {
+        char c; size_t n2; string inf;
+        if (fch) {
+            if (IsFence(v[k], c, n2, inf) && c == fch && n2 >= fn && inf.empty()) fch = 0;
+            continue;
+        }
+        if (IsFence(v[k], c, n2, inf)) { fch = c; fn = n2; }
+        if (IsBlank(v[k])) chunk = k + 1;
+    }
+    if (fch) return false;
+    char c; size_t n2; string inf; int lv; string t;
+    const string& last = v.back();
+    if (IsFence(last, c, n2, inf) || IsAtx(last, lv, t) || IsHr(last)) return false;
+    if (Indent(v[chunk]) >= 4) return false;
+    return true;
+}
+
 struct Node {
     string text;                 // literal HTML for non-delimiters
     bool delim = false;
@@ -615,6 +636,7 @@ public:
         }
         if (!lines.empty() && lines[0].size() >= 3 && (unsigned char)lines[0][0] == 0xEF && (unsigned char)lines[0][1] == 0xBB && (unsigned char)lines[0][2] == 0xBF)
             lines[0].erase(0, 3);
+        if (lines.size() > 1 && lines.back().empty()) lines.pop_back();
         for (auto& l : lines) {  // expand leading tabs
             size_t t = 0;
             while (t < l.size() && (l[t] == '\t' || l[t] == ' ')) t++;
@@ -722,12 +744,15 @@ private:
         return false;
     }
 
-    string Blocks(const vector<string>& lines, bool tight) {
+    string Blocks(const vector<string>& lines, bool tight, bool* gap = nullptr) {
         string out;
         size_t i = 0, n = lines.size();
+        bool sawBlank = false;
         while (i < n) {
             const string& l = lines[i];
-            if (IsBlank(l)) { i++; continue; }
+            if (IsBlank(l)) { sawBlank = true; i++; continue; }
+            if (sawBlank && gap && !out.empty()) *gap = true;
+            sawBlank = false;
 
             char fc; size_t fl; string info;
             int level; string htext;
@@ -779,8 +804,8 @@ private:
                         size_t p = Indent(q) + 1;
                         if (p < q.size() && q[p] == ' ') p++;
                         inner.push_back(q.substr(p));
-                    } else if (!IsBlank(q) && !inner.empty() && !IsBlank(inner.back()) && !BlockStart(q)) {
-                        inner.push_back(q);  // lazy continuation
+                    } else if (!IsBlank(q) && CanLazy(inner) && !BlockStart(q)) {
+                        inner.push_back("\x01" + LTrim(q));  // lazy continuation (marker keeps it from starting a block)
                     } else break;
                     i++;
                 }
@@ -870,7 +895,7 @@ private:
                 text += (i == start) ? LTrim(p) : LTrim(p);
                 i++;
             }
-            while (!text.empty() && text.back() == ' ') text.pop_back();
+            while (!text.empty() && isspace((unsigned char)text.back())) text.pop_back();
             if (setext) {
                 out += "<h" + std::to_string(setext) + ">" + Inline(text, false) + "</h" + std::to_string(setext) + ">\n";
             } else if (tight) {
@@ -902,10 +927,9 @@ private:
                     size_t j = i;
                     while (j < n && IsBlank(lines[j])) j++;
                     if (j >= n) { i = j; endAll = true; break; }
-                    if (Indent(lines[j]) >= cont) {
+                    if (!(item.size() == 1 && IsBlank(item[0])) && Indent(lines[j]) >= cont) {  // an item may start with at most one blank line
                         for (size_t k = i; k < j; k++) item.push_back("");
                         // blank line followed by a non-list paragraph line makes the list loose
-                        if (Indent(lines[j]) < cont + 2) loose = true;  // a direct child block after a blank line
                         i = j;
                         continue;
                     }
@@ -914,8 +938,7 @@ private:
                         loose = true;
                         i = j;
                     } else {
-                        i = j;
-                        endAll = true;
+                        endAll = true;  // leave the blank line for the enclosing block, which needs it to judge looseness
                     }
                     break;
                 }
@@ -926,7 +949,7 @@ private:
                 }
                 Marker nm = ParseMarker(l);
                 if (nm.ok || BlockStart(l)) break;
-                if (!item.empty() && !IsBlank(item.back())) { item.push_back(LTrim(l)); i++; continue; }  // lazy continuation
+                if (CanLazy(item)) { item.push_back("\x01" + LTrim(l)); i++; continue; }  // lazy continuation
                 break;
             }
             while (!item.empty() && IsBlank(item.back())) item.pop_back();
@@ -934,19 +957,34 @@ private:
         }
 
         out += first.ordered ? (first.start != 1 ? "<ol start=\"" + std::to_string(first.start) + "\">\n" : string("<ol>\n")) : "<ul>\n";
-        for (auto& item : items) {
-            string cls, box;
-            if (!item.empty()) {
-                const string& f = item[0];
-                if (f.size() >= 3 && f[0] == '[' && (f[1] == ' ' || f[1] == 'x' || f[1] == 'X') && f[2] == ']' && (f.size() == 3 || f[3] == ' ')) {
-                    bool done = f[1] != ' ';
-                    box = string("<input type=\"checkbox\" disabled") + (done ? " checked" : "") + "> ";
-                    cls = " class=\"task\"";
-                    item[0] = f.size() > 4 ? f.substr(4) : "";
-                }
+        vector<std::pair<string, string>> marks(items.size());  // class, checkbox
+        for (size_t k = 0; k < items.size(); k++) {
+            auto& item = items[k];
+            if (item.empty()) continue;
+            const string& f = item[0];
+            if (f.size() >= 3 && f[0] == '[' && (f[1] == ' ' || f[1] == 'x' || f[1] == 'X') && f[2] == ']' && (f.size() == 3 || f[3] == ' ')) {
+                bool done = f[1] != ' ';
+                marks[k].second = string("<input type=\"checkbox\" disabled") + (done ? " checked" : "") + "> ";
+                marks[k].first = " class=\"task\"";
+                item[0] = f.size() > 4 ? f.substr(4) : "";
             }
-            out += "<li" + cls + ">" + box + Blocks(item, !loose) + "</li>\n";
         }
+        // A list is loose if its items are separated by blank lines, or any item has two blocks separated by one.
+        auto footSnap = foot_;
+        auto orderSnap = footOrder_;
+        vector<string> bodies(items.size());
+        for (size_t k = 0; k < items.size(); k++) {
+            bool gap = false;
+            bodies[k] = Blocks(items[k], false, &gap);
+            if (gap) loose = true;
+        }
+        if (!loose) {  // render again without paragraph wrappers (undo footnote bookkeeping of the first pass)
+            foot_ = footSnap;
+            footOrder_ = orderSnap;
+            for (size_t k = 0; k < items.size(); k++) bodies[k] = Blocks(items[k], true);
+        }
+        for (size_t k = 0; k < items.size(); k++)
+            out += "<li" + marks[k].first + ">" + marks[k].second + bodies[k] + "</li>\n";
         out += first.ordered ? "</ol>\n" : "</ul>\n";
         return i;
     }
@@ -1059,6 +1097,7 @@ private:
         };
         while (i < n) {
             char c = s[i];
+            if (c == '\x01') { i++; continue; }
 
             if (c == '`') {
                 size_t k = i;
@@ -1178,7 +1217,7 @@ private:
                 while (i + r < n && s[i + r] == c) r++;
                 unsigned char prev = i > 0 ? (unsigned char)s[i - 1] : ' ';
                 unsigned char next = i + r < n ? (unsigned char)s[i + r] : ' ';
-                auto isSp = [](unsigned char x) { return x == ' ' || x == '\n' || x == '\t' || x == '\r' || x == '\f' || x == '\v'; };
+                auto isSp = [](unsigned char x) { return x == 1 || x == ' ' || x == '\n' || x == '\t' || x == '\r' || x == '\f' || x == '\v'; };
                 auto isPu = [](unsigned char x) { return x < 128 && ispunct(x); };
                 bool leftFlank = !isSp(next) && (!isPu(next) || isSp(prev) || isPu(prev));
                 bool rightFlank = !isSp(prev) && (!isPu(prev) || isSp(next) || isPu(next));

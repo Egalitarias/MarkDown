@@ -180,29 +180,62 @@ vector<string> SplitRow(const string& line) {
     return cells;
 }
 
+string EncodeUrl(const string& u) {
+    string o;
+    for (size_t i = 0; i < u.size(); i++) {
+        unsigned char c = (unsigned char)u[i];
+        if (c == '%' && i + 2 < u.size() && isxdigit((unsigned char)u[i + 1]) && isxdigit((unsigned char)u[i + 2])) { o += '%'; continue; }
+        if (c <= 0x20 || c >= 0x7F || strchr("\"<>\\^`{|}[]%", c)) { char b[4]; snprintf(b, sizeof b, "%%%02X", c); o += b; }
+        else o += (char)c;
+    }
+    return o;
+}
+
 string SafeUrl(string url, bool image, const string& imageBase) {
     url = Trim(url);
-    string out;
-    for (char c : url) {
-        if (c == ' ') out += "%20";
-        else if (c == '\\') out += '/';
-        else out += c;
-    }
+    string out = url;
+    if (image) for (auto& c : out) if (c == '\\') c = '/';  // tolerate Windows-style image paths
     size_t colon = out.find(':');
     size_t slash = out.find_first_of("/?#");
-    bool hasScheme = colon != string::npos && colon > 0 && (slash == string::npos || colon < slash);
+    bool hasScheme = colon != string::npos && colon > 0 && (slash == string::npos || colon < slash) && isalpha((unsigned char)out[0]);
+    for (size_t k = 1; hasScheme && k < colon; k++)
+        if (!isalnum((unsigned char)out[k]) && out[k] != '+' && out[k] != '-' && out[k] != '.') hasScheme = false;
     if (hasScheme) {
         string scheme = Lower(out.substr(0, colon));
         if (scheme.size() == 1) return "#";  // drive letter path, not loadable
-        if (scheme == "http" || scheme == "https" || (!image && (scheme == "mailto" || scheme == "tel"))) return out;
+        if (scheme == "http" || scheme == "https" || (!image && (scheme == "mailto" || scheme == "tel"))) return EncodeUrl(out);
         if (image && scheme == "data" && StartsWith(Lower(out), 0, "data:image/") && Lower(out).find("svg") == string::npos) return out;
         return "#";
     }
     if (image && !out.empty() && out[0] != '/' && out[0] != '#' && !(out.size() > 1 && out[0] == '/' && out[1] == '/')) {
         if (StartsWith(out, 0, "./")) out.erase(0, 2);
-        return imageBase + out;
+        return imageBase + EncodeUrl(out);
     }
-    return out;
+    return EncodeUrl(out);
+}
+
+// Plain-text rendering of already-rendered inline HTML, for image alt attributes.
+string AltText(const string& html) {
+    string o;
+    size_t n = html.size();
+    for (size_t i = 0; i < n;) {
+        if (html[i] == '<') {
+            size_t e = html.find('>', i);
+            if (e == string::npos) break;
+            string tag = html.substr(i, e - i + 1);
+            if (tag.compare(0, 4, "<img") == 0) {
+                size_t a = tag.find(" alt=\"");
+                if (a != string::npos) {
+                    size_t c = tag.find('"', a + 6);
+                    if (c != string::npos) o += tag.substr(a + 6, c - a - 6);
+                }
+            }
+            i = e + 1;
+            continue;
+        }
+        o += html[i++];
+    }
+    return o;
 }
 
 
@@ -936,6 +969,15 @@ private:
                 j = k - 1;
                 continue;
             }
+            if (c == '<') {
+                Tag tg = ParseTag(s, j);
+                if (tg.ok) { j = tg.end - 1; continue; }
+                size_t e = s.find('>', j);
+                if (e != string::npos) {
+                    static const std::regex ac(R"(^([A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})$)");
+                    if (std::regex_match(s.substr(j + 1, e - j - 1), ac)) { j = e; continue; }
+                }
+            }
             if (c == '[') depth++;
             else if (c == ']') { if (--depth == 0) break; }
         }
@@ -944,39 +986,47 @@ private:
         size_t p = j + 1;
         if (p < n && s[p] == '(') {
             size_t q = p + 1;
-            while (q < n && (s[q] == ' ' || s[q] == '\n')) q++;
-            string dest;
+            bool ok = true;
+            auto sp = [&]() { while (q < n && (s[q] == ' ' || s[q] == '\n')) q++; };
+            sp();
+            string dest, t;
             if (q < n && s[q] == '<') {
-                size_t e = s.find('>', q);
-                if (e == string::npos) return false;
-                dest = s.substr(q + 1, e - q - 1);
-                q = e + 1;
+                size_t b = ++q;
+                while (q < n && s[q] != '>') {
+                    if (s[q] == '\n' || s[q] == '<') { ok = false; break; }
+                    if (s[q] == '\\' && q + 1 < n) q++;
+                    q++;
+                }
+                if (ok && q < n) { dest = s.substr(b, q - b); q++; }
+                else ok = false;
             } else {
                 int par = 0;
                 while (q < n) {
                     char c = s[q];
-                    if (c == '\\' && q + 1 < n) { dest += s[q + 1]; q += 2; continue; }
+                    if (c == '\\' && q + 1 < n && ispunct((unsigned char)s[q + 1])) { dest += c; dest += s[q + 1]; q += 2; continue; }
                     if (c == ' ' || c == '\n') break;
                     if (c == '(') par++;
                     if (c == ')') { if (par == 0) break; par--; }
                     dest += c;
                     q++;
                 }
+                if (par != 0) ok = false;
             }
-            while (q < n && (s[q] == ' ' || s[q] == '\n')) q++;
-            string t;
-            if (q < n && (s[q] == '"' || s[q] == '\'' || s[q] == '(')) {
-                char close = s[q] == '(' ? ')' : s[q];
-                size_t e = q + 1;
-                while (e < n && s[e] != close) { if (s[e] == '\\') e++; e++; }
-                if (e >= n) return false;
-                t = s.substr(q + 1, e - q - 1);
-                q = e + 1;
-                while (q < n && (s[q] == ' ' || s[q] == '\n')) q++;
+            if (ok) {
+                sp();
+                if (q < n && (s[q] == '"' || s[q] == '\'' || s[q] == '(')) {
+                    char close = s[q] == '(' ? ')' : s[q];
+                    size_t e = q + 1;
+                    while (e < n && s[e] != close) { if (s[e] == '\\') e++; e++; }
+                    if (e >= n) ok = false;
+                    else { t = s.substr(q + 1, e - q - 1); q = e + 1; sp(); }
+                }
             }
-            if (q >= n || s[q] != ')') return false;
-            url = Unescape(dest); title = Unescape(t); end = q + 1;
-            return true;
+            if (ok && q < n && s[q] == ')') {
+                url = Unescape(dest); title = Unescape(t); end = q + 1;
+                return true;
+            }
+            // otherwise the brackets may still be a shortcut reference link
         }
         string label;
         size_t endPos = j + 1;
@@ -1047,7 +1097,7 @@ private:
             if (c == '!' && i + 1 < n && s[i + 1] == '[') {
                 string text, url, title; size_t end;
                 if (ParseLink(s, i + 1, noAuto, text, url, title, end)) {
-                    out += "<img src=\"" + Esc(SafeUrl(url, true, imageBase_)) + "\" alt=\"" + Esc(text) + "\"" +
+                    out += "<img src=\"" + Esc(SafeUrl(url, true, imageBase_)) + "\" alt=\"" + AltText(Inline(text, true)) + "\"" +
                            (title.empty() ? "" : " title=\"" + Esc(title) + "\"") + ">";
                     i = end;
                     continue;
@@ -1072,10 +1122,14 @@ private:
             if (c == '[') {
                 string text, url, title; size_t end;
                 if (ParseLink(s, i, noAuto, text, url, title, end)) {
-                    out += "<a href=\"" + Esc(SafeUrl(url, false, imageBase_)) + "\"" +
-                           (title.empty() ? "" : " title=\"" + Esc(title) + "\"") + ">" + Inline(text, true) + "</a>";
-                    i = end;
-                    continue;
+                    string inner = Inline(text, true);
+                    if (inner.find("<a ") == string::npos) {
+                        out += "<a href=\"" + Esc(SafeUrl(url, false, imageBase_)) + "\"" +
+                               (title.empty() ? "" : " title=\"" + Esc(title) + "\"") + ">" + inner + "</a>";
+                        i = end;
+                        continue;
+                    }
+                    // a nested link wins: this bracket is literal text
                 }
             }
             if (c == '<') {

@@ -1,0 +1,721 @@
+#include "markdown.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <map>
+#include <regex>
+#include <vector>
+
+using std::string;
+using std::vector;
+
+namespace {
+
+string Esc(const string& s) {
+    string o;
+    o.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '&': o += "&amp;"; break;
+            case '<': o += "&lt;"; break;
+            case '>': o += "&gt;"; break;
+            case '"': o += "&quot;"; break;
+            default: o += c;
+        }
+    }
+    return o;
+}
+
+string Trim(const string& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && isspace((unsigned char)s[a])) a++;
+    while (b > a && isspace((unsigned char)s[b - 1])) b--;
+    return s.substr(a, b - a);
+}
+
+string LTrim(const string& s) {
+    size_t a = 0;
+    while (a < s.size() && isspace((unsigned char)s[a])) a++;
+    return s.substr(a);
+}
+
+bool IsBlank(const string& s) {
+    for (char c : s) if (!isspace((unsigned char)c)) return false;
+    return true;
+}
+
+size_t Indent(const string& s) {
+    size_t n = 0;
+    while (n < s.size() && s[n] == ' ') n++;
+    return n;
+}
+
+bool IsAlnum(char c) { return isalnum((unsigned char)c) != 0 || (unsigned char)c >= 0x80; }
+
+string Lower(string s) {
+    for (auto& c : s) c = (char)tolower((unsigned char)c);
+    return s;
+}
+
+string NormLabel(const string& s) {
+    string o;
+    bool sp = false;
+    for (char c : s) {
+        if (isspace((unsigned char)c)) { sp = true; continue; }
+        if (sp && !o.empty()) o += ' ';
+        sp = false;
+        o += (char)tolower((unsigned char)c);
+    }
+    return o;
+}
+
+bool StartsWith(const string& s, size_t pos, const char* lit) {
+    size_t n = strlen(lit);
+    return s.compare(pos, n, lit) == 0;
+}
+
+struct Marker {
+    bool ok = false;
+    size_t indent = 0, content = 0;
+    bool ordered = false;
+    char type = 0;     // bullet char, or '.' / ')' for ordered
+    int start = 1;
+};
+
+Marker ParseMarker(const string& l) {
+    Marker m;
+    size_t p = Indent(l);
+    if (p > 3 || p >= l.size()) return m;
+    size_t q = p;
+    if (l[q] == '-' || l[q] == '*' || l[q] == '+') {
+        m.type = l[q];
+        q++;
+    } else if (isdigit((unsigned char)l[q])) {
+        size_t d = q;
+        while (d < l.size() && isdigit((unsigned char)l[d])) d++;
+        if (d - q > 9 || d >= l.size() || (l[d] != '.' && l[d] != ')')) return m;
+        m.ordered = true;
+        m.type = l[d];
+        m.start = atoi(l.substr(q, d - q).c_str());
+        q = d + 1;
+    } else {
+        return m;
+    }
+    if (q < l.size() && l[q] != ' ') return m;
+    size_t sp = 0;
+    while (q + sp < l.size() && l[q + sp] == ' ') sp++;
+    if (q + sp >= l.size() || sp > 4) sp = 1;  // blank item or code-indented content
+    m.ok = true;
+    m.indent = p;
+    m.content = q + sp;
+    return m;
+}
+
+bool IsHr(const string& l) {
+    static const std::regex re(R"(^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$)");
+    return std::regex_match(l, re);
+}
+
+bool IsAtx(const string& l, int& level, string& text) {
+    size_t p = Indent(l);
+    if (p > 3) return false;
+    size_t q = p;
+    while (q < l.size() && l[q] == '#') q++;
+    int lv = (int)(q - p);
+    if (lv < 1 || lv > 6) return false;
+    if (q < l.size() && l[q] != ' ' && l[q] != '\t') return false;
+    string t = Trim(l.substr(q));
+    // strip optional closing sequence
+    size_t e = t.size();
+    while (e > 0 && t[e - 1] == '#') e--;
+    if (e < t.size() && (e == 0 || t[e - 1] == ' ')) t = Trim(t.substr(0, e));
+    level = lv;
+    text = t;
+    return true;
+}
+
+bool IsFence(const string& l, char& ch, size_t& n, string& info) {
+    size_t p = Indent(l);
+    if (p > 3 || p >= l.size()) return false;
+    char c = l[p];
+    if (c != '`' && c != '~') return false;
+    size_t q = p;
+    while (q < l.size() && l[q] == c) q++;
+    if (q - p < 3) return false;
+    string rest = Trim(l.substr(q));
+    if (c == '`' && rest.find('`') != string::npos) return false;
+    ch = c;
+    n = q - p;
+    info = rest;
+    return true;
+}
+
+bool IsQuote(const string& l) {
+    size_t p = Indent(l);
+    return p <= 3 && p < l.size() && l[p] == '>';
+}
+
+bool IsDelimRow(const string& l) {
+    static const std::regex re(R"(^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$)");
+    return l.find('-') != string::npos && std::regex_match(l, re);
+}
+
+vector<string> SplitRow(const string& line) {
+    string l = Trim(line);
+    if (!l.empty() && l[0] == '|') l.erase(0, 1);
+    if (!l.empty() && l.back() == '|' && (l.size() < 2 || l[l.size() - 2] != '\\')) l.pop_back();
+    vector<string> cells;
+    string cur;
+    bool code = false;
+    for (size_t i = 0; i < l.size(); i++) {
+        char c = l[i];
+        if (c == '\\' && i + 1 < l.size() && l[i + 1] == '|') { cur += '|'; i++; continue; }
+        if (c == '`') code = !code;
+        if (c == '|' && !code) { cells.push_back(Trim(cur)); cur.clear(); continue; }
+        cur += c;
+    }
+    cells.push_back(Trim(cur));
+    return cells;
+}
+
+string SafeUrl(string url, bool image, const string& imageBase) {
+    url = Trim(url);
+    string out;
+    for (char c : url) {
+        if (c == ' ') out += "%20";
+        else if (c == '\\') out += '/';
+        else out += c;
+    }
+    size_t colon = out.find(':');
+    size_t slash = out.find_first_of("/?#");
+    bool hasScheme = colon != string::npos && colon > 0 && (slash == string::npos || colon < slash);
+    if (hasScheme) {
+        string scheme = Lower(out.substr(0, colon));
+        if (scheme.size() == 1) return "#";  // drive letter path, not loadable
+        if (scheme == "http" || scheme == "https" || (!image && (scheme == "mailto" || scheme == "tel"))) return out;
+        if (image && scheme == "data" && StartsWith(Lower(out), 0, "data:image/") && Lower(out).find("svg") == string::npos) return out;
+        return "#";
+    }
+    if (image && !out.empty() && out[0] != '/' && out[0] != '#' && !(out.size() > 1 && out[0] == '/' && out[1] == '/')) {
+        if (StartsWith(out, 0, "./")) out.erase(0, 2);
+        return imageBase + out;
+    }
+    return out;
+}
+
+const char* kAllowedTags[] = {"br", "kbd", "sub", "sup", "b", "i", "u", "em", "strong", "mark", "details",
+                              "summary", "del", "ins", "small", "p", "center", "hr", "s"};
+
+class Renderer {
+public:
+    explicit Renderer(string imageBase) : imageBase_(std::move(imageBase)) {}
+
+    string Run(const string& md) {
+        vector<string> lines;
+        {
+            string cur;
+            for (size_t i = 0; i < md.size(); i++) {
+                char c = md[i];
+                if (c == '\r') { if (i + 1 < md.size() && md[i + 1] == '\n') i++; lines.push_back(cur); cur.clear(); }
+                else if (c == '\n') { lines.push_back(cur); cur.clear(); }
+                else cur += c;
+            }
+            lines.push_back(cur);
+        }
+        if (!lines.empty() && lines[0].size() >= 3 && (unsigned char)lines[0][0] == 0xEF && (unsigned char)lines[0][1] == 0xBB && (unsigned char)lines[0][2] == 0xBF)
+            lines[0].erase(0, 3);
+        for (auto& l : lines) {  // expand leading tabs
+            size_t t = 0;
+            while (t < l.size() && (l[t] == '\t' || l[t] == ' ')) t++;
+            if (l.find('\t') < t) {
+                string lead;
+                for (size_t k = 0; k < t; k++) lead += (l[k] == '\t') ? string("    ") : string(" ");
+                l = lead + l.substr(t);
+            }
+        }
+        lines = ExtractRefs(lines);
+        return Blocks(lines, false);
+    }
+
+private:
+    string imageBase_;
+    std::map<string, std::pair<string, string>> refs_;
+
+    vector<string> ExtractRefs(const vector<string>& in) {
+        static const std::regex re(R"re(^ {0,3}\[([^\]\^][^\]]*)\]:\s*(<[^>]*>|\S+)(?:\s+(?:"([^"]*)"|'([^']*)'|\(([^)]*)\)))?\s*$)re");
+        vector<string> out;
+        char fch = 0; size_t fn = 0; string info;
+        for (const auto& l : in) {
+            char c; size_t n; string inf;
+            if (fch) {
+                if (IsFence(l, c, n, inf) && c == fch && n >= fn && inf.empty()) fch = 0;
+                out.push_back(l);
+                continue;
+            }
+            if (IsFence(l, c, n, inf)) { fch = c; fn = n; out.push_back(l); continue; }
+            std::smatch m;
+            if (std::regex_match(l, m, re)) {
+                string url = m[2].str();
+                if (url.size() >= 2 && url.front() == '<' && url.back() == '>') url = url.substr(1, url.size() - 2);
+                string title = m[3].matched ? m[3].str() : m[4].matched ? m[4].str() : m[5].matched ? m[5].str() : "";
+                refs_.emplace(NormLabel(m[1].str()), std::make_pair(url, title));
+                continue;
+            }
+            out.push_back(l);
+        }
+        return out;
+    }
+
+    static bool BlockStart(const string& l) {
+        char c; size_t n; string inf; int lv; string t;
+        if (IsFence(l, c, n, inf) || IsAtx(l, lv, t) || IsQuote(l) || IsHr(l)) return true;
+        Marker m = ParseMarker(l);
+        if (m.ok && !IsBlank(l.substr(m.content)) && (!m.ordered || m.start == 1)) return true;
+        return false;
+    }
+
+    string Blocks(const vector<string>& lines, bool tight) {
+        string out;
+        size_t i = 0, n = lines.size();
+        while (i < n) {
+            const string& l = lines[i];
+            if (IsBlank(l)) { i++; continue; }
+
+            char fc; size_t fl; string info;
+            int level; string htext;
+
+            if (IsFence(l, fc, fl, info)) {
+                size_t ind = Indent(l);
+                string code;
+                i++;
+                while (i < n) {
+                    char c2; size_t n2; string i2;
+                    if (IsFence(lines[i], c2, n2, i2) && c2 == fc && n2 >= fl && i2.empty()) { i++; break; }
+                    string row = lines[i];
+                    size_t strip = std::min(ind, Indent(row));
+                    code += row.substr(strip) + "\n";
+                    i++;
+                }
+                string lang = info.substr(0, info.find_first_of(" \t{"));
+                out += "<pre><code";
+                if (!lang.empty()) out += " class=\"language-" + Esc(lang) + "\"";
+                out += ">" + Esc(code) + "</code></pre>\n";
+                continue;
+            }
+            if (IsAtx(l, level, htext)) {
+                out += "<h" + std::to_string(level) + ">" + Inline(htext, false) + "</h" + std::to_string(level) + ">\n";
+                i++;
+                continue;
+            }
+            if (IsHr(l)) { out += "<hr>\n"; i++; continue; }
+
+            if (IsQuote(l)) {
+                vector<string> inner;
+                while (i < n) {
+                    const string& q = lines[i];
+                    if (IsQuote(q)) {
+                        size_t p = Indent(q) + 1;
+                        if (p < q.size() && q[p] == ' ') p++;
+                        inner.push_back(q.substr(p));
+                    } else if (!IsBlank(q) && !inner.empty() && !IsBlank(inner.back()) && !BlockStart(q)) {
+                        inner.push_back(q);  // lazy continuation
+                    } else break;
+                    i++;
+                }
+                string cls, title;
+                if (!inner.empty()) {
+                    static const std::regex alert(R"(^\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$)", std::regex::icase);
+                    std::smatch m;
+                    if (std::regex_match(inner[0], m, alert)) {
+                        title = m[1].str();
+                        string low = Lower(title);
+                        cls = " class=\"alert alert-" + low + "\"";
+                        title[0] = (char)toupper((unsigned char)title[0]);
+                        for (size_t k = 1; k < title.size(); k++) title[k] = (char)tolower((unsigned char)title[k]);
+                        inner.erase(inner.begin());
+                    }
+                }
+                out += "<blockquote" + cls + ">\n";
+                if (!title.empty()) out += "<p class=\"alert-title\">" + title + "</p>\n";
+                out += Blocks(inner, false) + "</blockquote>\n";
+                continue;
+            }
+
+            // table
+            if (l.find('|') != string::npos && i + 1 < n && IsDelimRow(lines[i + 1]) && lines[i + 1].find('|') != string::npos) {
+                vector<string> head = SplitRow(l), delim = SplitRow(lines[i + 1]);
+                if (head.size() == delim.size()) {
+                    vector<string> align;
+                    for (auto& d : delim) {
+                        bool L = !d.empty() && d.front() == ':', R = !d.empty() && d.back() == ':';
+                        align.push_back(L && R ? "center" : R ? "right" : L ? "left" : "");
+                    }
+                    auto cell = [&](const char* tag, const string& txt, size_t col) {
+                        string a = col < align.size() && !align[col].empty() ? string(" style=\"text-align:") + align[col] + "\"" : "";
+                        return string("<") + tag + a + ">" + Inline(txt, false) + "</" + tag + ">";
+                    };
+                    out += "<table>\n<thead><tr>";
+                    for (size_t c = 0; c < head.size(); c++) out += cell("th", head[c], c);
+                    out += "</tr></thead>\n<tbody>\n";
+                    i += 2;
+                    while (i < n && !IsBlank(lines[i]) && lines[i].find('|') != string::npos) {
+                        vector<string> row = SplitRow(lines[i]);
+                        out += "<tr>";
+                        for (size_t c = 0; c < head.size(); c++) out += cell("td", c < row.size() ? row[c] : "", c);
+                        out += "</tr>\n";
+                        i++;
+                    }
+                    out += "</tbody></table>\n";
+                    continue;
+                }
+            }
+
+            Marker m0 = ParseMarker(l);
+            if (m0.ok) {
+                i = List(lines, i, m0, out);
+                continue;
+            }
+
+            if (Indent(l) >= 4) {
+                string code;
+                size_t blanks = 0;
+                while (i < n) {
+                    if (IsBlank(lines[i])) { blanks++; i++; continue; }
+                    if (Indent(lines[i]) < 4) break;
+                    code += string(blanks, '\n') + lines[i].substr(4) + "\n";
+                    blanks = 0;
+                    i++;
+                }
+                out += "<pre><code>" + Esc(code) + "</code></pre>\n";
+                continue;
+            }
+
+            // paragraph / setext heading
+            string text;
+            size_t start = i;
+            int setext = 0;
+            while (i < n) {
+                const string& p = lines[i];
+                if (IsBlank(p)) break;
+                if (i > start) {
+                    static const std::regex ul(R"(^ {0,3}(=+|-+)[ \t]*$)");
+                    std::smatch m;
+                    if (std::regex_match(p, m, ul)) { setext = m[1].str()[0] == '=' ? 1 : 2; i++; break; }
+                    if (BlockStart(p)) break;
+                    if (p.find('|') != string::npos && i + 1 < n && IsDelimRow(lines[i + 1])) break;
+                }
+                if (i > start) text += "\n";
+                text += (i == start) ? LTrim(p) : LTrim(p);
+                i++;
+            }
+            while (!text.empty() && text.back() == ' ') text.pop_back();
+            if (setext) {
+                out += "<h" + std::to_string(setext) + ">" + Inline(text, false) + "</h" + std::to_string(setext) + ">\n";
+            } else if (tight) {
+                out += Inline(text, false) + "\n";
+            } else {
+                out += "<p>" + Inline(text, false) + "</p>\n";
+            }
+        }
+        return out;
+    }
+
+    size_t List(const vector<string>& lines, size_t i, const Marker& first, string& out) {
+        size_t n = lines.size();
+        vector<vector<string>> items;
+        bool loose = false;
+        bool endAll = false;
+
+        while (i < n && !endAll) {
+            Marker m = ParseMarker(lines[i]);
+            if (!m.ok || m.ordered != first.ordered || m.type != first.type) break;
+            if (!items.empty() && IsHr(lines[i])) break;
+            vector<string> item;
+            size_t cont = m.content;
+            item.push_back(m.content <= lines[i].size() ? lines[i].substr(m.content) : "");
+            i++;
+            while (i < n) {
+                const string& l = lines[i];
+                if (IsBlank(l)) {
+                    size_t j = i;
+                    while (j < n && IsBlank(lines[j])) j++;
+                    if (j >= n) { i = j; endAll = true; break; }
+                    if (Indent(lines[j]) >= cont) {
+                        for (size_t k = i; k < j; k++) item.push_back("");
+                        // blank line followed by a non-list paragraph line makes the list loose
+                        if (!ParseMarker(lines[j].substr(cont)).ok) loose = true;
+                        i = j;
+                        continue;
+                    }
+                    Marker nm = ParseMarker(lines[j]);
+                    if (nm.ok && nm.ordered == first.ordered && nm.type == first.type && !IsHr(lines[j])) {
+                        loose = true;
+                        i = j;
+                    } else {
+                        i = j;
+                        endAll = true;
+                    }
+                    break;
+                }
+                if (Indent(l) >= cont) {
+                    item.push_back(l.substr(cont));
+                    i++;
+                    continue;
+                }
+                Marker nm = ParseMarker(l);
+                if (nm.ok || BlockStart(l)) break;
+                if (!item.empty() && !IsBlank(item.back())) { item.push_back(LTrim(l)); i++; continue; }  // lazy continuation
+                break;
+            }
+            while (!item.empty() && IsBlank(item.back())) item.pop_back();
+            items.push_back(std::move(item));
+        }
+
+        out += first.ordered ? (first.start != 1 ? "<ol start=\"" + std::to_string(first.start) + "\">\n" : string("<ol>\n")) : "<ul>\n";
+        for (auto& item : items) {
+            string cls, box;
+            if (!item.empty()) {
+                const string& f = item[0];
+                if (f.size() >= 3 && f[0] == '[' && (f[1] == ' ' || f[1] == 'x' || f[1] == 'X') && f[2] == ']' && (f.size() == 3 || f[3] == ' ')) {
+                    bool done = f[1] != ' ';
+                    box = string("<input type=\"checkbox\" disabled") + (done ? " checked" : "") + "> ";
+                    cls = " class=\"task\"";
+                    item[0] = f.size() > 4 ? f.substr(4) : "";
+                }
+            }
+            out += "<li" + cls + ">" + box + Blocks(item, !loose) + "</li>\n";
+        }
+        out += first.ordered ? "</ol>\n" : "</ul>\n";
+        return i;
+    }
+
+    // ---- inline ----
+
+    bool ParseLink(const string& s, size_t open, bool noAuto, string& text, string& url, string& title, size_t& end) {
+        size_t n = s.size();
+        int depth = 0;
+        size_t j = open;
+        for (; j < n; j++) {
+            char c = s[j];
+            if (c == '\\') { j++; continue; }
+            if (c == '`') {
+                size_t k = j;
+                while (k < n && s[k] == '`') k++;
+                string run = s.substr(j, k - j);
+                size_t f = s.find(run, k);
+                if (f != string::npos) { j = f + run.size() - 1; continue; }
+                j = k - 1;
+                continue;
+            }
+            if (c == '[') depth++;
+            else if (c == ']') { if (--depth == 0) break; }
+        }
+        if (j >= n) return false;
+        text = s.substr(open + 1, j - open - 1);
+        size_t p = j + 1;
+        if (p < n && s[p] == '(') {
+            size_t q = p + 1;
+            while (q < n && (s[q] == ' ' || s[q] == '\n')) q++;
+            string dest;
+            if (q < n && s[q] == '<') {
+                size_t e = s.find('>', q);
+                if (e == string::npos) return false;
+                dest = s.substr(q + 1, e - q - 1);
+                q = e + 1;
+            } else {
+                int par = 0;
+                while (q < n) {
+                    char c = s[q];
+                    if (c == '\\' && q + 1 < n) { dest += s[q + 1]; q += 2; continue; }
+                    if (c == ' ' || c == '\n') break;
+                    if (c == '(') par++;
+                    if (c == ')') { if (par == 0) break; par--; }
+                    dest += c;
+                    q++;
+                }
+            }
+            while (q < n && (s[q] == ' ' || s[q] == '\n')) q++;
+            string t;
+            if (q < n && (s[q] == '"' || s[q] == '\'' || s[q] == '(')) {
+                char close = s[q] == '(' ? ')' : s[q];
+                size_t e = q + 1;
+                while (e < n && s[e] != close) { if (s[e] == '\\') e++; e++; }
+                if (e >= n) return false;
+                t = s.substr(q + 1, e - q - 1);
+                q = e + 1;
+                while (q < n && (s[q] == ' ' || s[q] == '\n')) q++;
+            }
+            if (q >= n || s[q] != ')') return false;
+            url = dest; title = t; end = q + 1;
+            return true;
+        }
+        string label;
+        size_t endPos = j + 1;
+        if (p < n && s[p] == '[') {
+            size_t e = s.find(']', p);
+            if (e == string::npos) return false;
+            label = s.substr(p + 1, e - p - 1);
+            if (label.empty()) label = text;
+            endPos = e + 1;
+        } else {
+            label = text;
+        }
+        auto it = refs_.find(NormLabel(label));
+        if (it == refs_.end()) return false;
+        url = it->second.first; title = it->second.second; end = endPos;
+        (void)noAuto;
+        return true;
+    }
+
+    string Inline(const string& s, bool noAuto) {
+        string out;
+        size_t n = s.size(), i = 0;
+        while (i < n) {
+            char c = s[i];
+
+            if (c == '`') {
+                size_t k = i;
+                while (k < n && s[k] == '`') k++;
+                string run = s.substr(i, k - i);
+                size_t f = s.find(run, k);
+                while (f != string::npos && f + run.size() < n && s[f + run.size()] == '`') {
+                    size_t g = f;
+                    while (g < n && s[g] == '`') g++;
+                    f = s.find(run, g);
+                }
+                if (f != string::npos) {
+                    string code = s.substr(k, f - k);
+                    for (auto& ch : code) if (ch == '\n') ch = ' ';
+                    if (code.size() >= 2 && code.front() == ' ' && code.back() == ' ' && !IsBlank(code)) code = code.substr(1, code.size() - 2);
+                    out += "<code>" + Esc(code) + "</code>";
+                    i = f + run.size();
+                } else {
+                    out += run;
+                    i = k;
+                }
+                continue;
+            }
+            if (c == '\\' && i + 1 < n) {
+                if (ispunct((unsigned char)s[i + 1])) { out += Esc(string(1, s[i + 1])); i += 2; continue; }
+                if (s[i + 1] == '\n') { out += "<br>\n"; i += 2; continue; }
+            }
+            if (c == '\n') {
+                size_t sp = 0;
+                while (sp < out.size() && out[out.size() - 1 - sp] == ' ') sp++;
+                out.resize(out.size() - sp);
+                out += sp >= 2 ? "<br>\n" : "\n";
+                i++;
+                continue;
+            }
+            if (c == '!' && i + 1 < n && s[i + 1] == '[') {
+                string text, url, title; size_t end;
+                if (ParseLink(s, i + 1, noAuto, text, url, title, end)) {
+                    out += "<img src=\"" + Esc(SafeUrl(url, true, imageBase_)) + "\" alt=\"" + Esc(text) + "\"" +
+                           (title.empty() ? "" : " title=\"" + Esc(title) + "\"") + ">";
+                    i = end;
+                    continue;
+                }
+            }
+            if (c == '[') {
+                string text, url, title; size_t end;
+                if (ParseLink(s, i, noAuto, text, url, title, end)) {
+                    out += "<a href=\"" + Esc(SafeUrl(url, false, imageBase_)) + "\"" +
+                           (title.empty() ? "" : " title=\"" + Esc(title) + "\"") + ">" + Inline(text, true) + "</a>";
+                    i = end;
+                    continue;
+                }
+            }
+            if (c == '<') {
+                size_t e = s.find('>', i);
+                if (e != string::npos) {
+                    string inner = s.substr(i + 1, e - i - 1);
+                    static const std::regex url(R"(^(https?://[^\s<>]+|mailto:[^\s<>]+)$)", std::regex::icase);
+                    static const std::regex mail(R"(^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$)");
+                    if (std::regex_match(inner, url)) {
+                        out += "<a href=\"" + Esc(inner) + "\">" + Esc(inner) + "</a>";
+                        i = e + 1; continue;
+                    }
+                    if (std::regex_match(inner, mail)) {
+                        out += "<a href=\"mailto:" + Esc(inner) + "\">" + Esc(inner) + "</a>";
+                        i = e + 1; continue;
+                    }
+                    string name = Lower(inner);
+                    if (!name.empty() && name[0] == '/') name.erase(0, 1);
+                    if (!name.empty() && name.back() == '/') name.pop_back();
+                    name = Trim(name);
+                    bool ok = false;
+                    for (auto t : kAllowedTags) if (name == t) ok = true;
+                    if (ok) { out += "<" + Lower(inner) + ">"; i = e + 1; continue; }
+                }
+                out += "&lt;"; i++; continue;
+            }
+            if (!noAuto && c == 'h' && (StartsWith(s, i, "http://") || StartsWith(s, i, "https://")) && (i == 0 || !IsAlnum(s[i - 1]))) {
+                size_t e = i;
+                while (e < n && !isspace((unsigned char)s[e]) && s[e] != '<') e++;
+                while (e > i && strchr(".,;:!?'\"*_~", s[e - 1])) e--;
+                if (e > i && s[e - 1] == ')' && s.substr(i, e - i).find('(') == string::npos) e--;
+                string u = s.substr(i, e - i);
+                out += "<a href=\"" + Esc(u) + "\">" + Esc(u) + "</a>";
+                i = e;
+                continue;
+            }
+            if (c == '*' || c == '_' || c == '~') {
+                size_t r = 0;
+                while (i + r < n && s[i + r] == c) r++;
+                bool valid = (c == '~') ? r == 2 : r <= 3;
+                bool leftFlank = i + r < n && !isspace((unsigned char)s[i + r]);
+                if (c == '_' && i > 0 && IsAlnum(s[i - 1])) leftFlank = false;
+                if (valid && leftFlank) {
+                    size_t j = i + r;
+                    bool found = false;
+                    while (j < n) {
+                        if (s[j] == '\\') { j += 2; continue; }
+                        if (s[j] == '`') {
+                            size_t k = j;
+                            while (k < n && s[k] == '`') k++;
+                            size_t f = s.find(s.substr(j, k - j), k);
+                            j = (f != string::npos) ? f + (k - j) : k;
+                            continue;
+                        }
+                        if (s[j] == c) {
+                            size_t rr = 0;
+                            while (j + rr < n && s[j + rr] == c) rr++;
+                            bool rightFlank = j > i + r && !isspace((unsigned char)s[j - 1]);
+                            if (c == '_' && j + rr < n && IsAlnum(s[j + rr])) rightFlank = false;
+                            if (rr == r && rightFlank) { found = true; break; }
+                            j += rr;
+                            continue;
+                        }
+                        j++;
+                    }
+                    if (found) {
+                        string inner = Inline(s.substr(i + r, j - i - r), noAuto);
+                        if (c == '~') out += "<del>" + inner + "</del>";
+                        else if (r == 1) out += "<em>" + inner + "</em>";
+                        else if (r == 2) out += "<strong>" + inner + "</strong>";
+                        else out += "<strong><em>" + inner + "</em></strong>";
+                        i = j + r;
+                        continue;
+                    }
+                }
+                out += string(r, c);
+                i += r;
+                continue;
+            }
+            if (c == '&') { out += "&amp;"; i++; continue; }
+            if (c == '>') { out += "&gt;"; i++; continue; }
+            if (c == '"') { out += "&quot;"; i++; continue; }
+            out += c;
+            i++;
+        }
+        return out;
+    }
+};
+
+}  // namespace
+
+std::string RenderMarkdown(const std::string& markdown, const std::string& imageBase) {
+    Renderer r(imageBase);
+    return r.Run(markdown);
+}

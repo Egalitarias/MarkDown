@@ -1,0 +1,49 @@
+#include <windows.h>
+#include "resource.h"
+
+1 24 "app.manifest"
+IDR_SHELL   RCDATA "shell.html"
+IDR_WELCOME RCDATA "welcome.md"
+
+IDM_MENU MENU
+BEGIN
+    POPUP "&File"
+    BEGIN
+        MENUITEM "&Open...\tCtrl+O",           IDM_OPEN
+        MENUITEM "Open &URL...\tCtrl+U",       IDM_OPENURL
+        MENUITEM "&Reload\tF5",                IDM_RELOAD
+        MENUITEM SEPARATOR
+        MENUITEM "&Export as HTML...\tCtrl+S", IDM_EXPORT
+        MENUITEM "&Print...\tCtrl+P",          IDM_PRINT
+        MENUITEM SEPARATOR
+        MENUITEM "E&xit",                      IDM_EXIT
+    END
+    POPUP "&View"
+    BEGIN
+        MENUITEM "&Find...\tCtrl+F",           IDM_FIND
+        MENUITEM SEPARATOR
+        MENUITEM "&Outline\tCtrl+B",           IDM_OUTLINE
+        MENUITEM "&Dark theme\tCtrl+D",        IDM_THEME
+        MENUITEM "&Wide layout\tCtrl+L",       IDM_WIDE
+        MENUITEM "&Always on top",             IDM_ONTOP
+        MENUITEM SEPARATOR
+        MENUITEM "Zoom &in\tCtrl++",           IDM_ZOOMIN
+        MENUITEM "Zoom &out\tCtrl+-",          IDM_ZOOMOUT
+        MENUITEM "&Reset zoom\tCtrl+0",        IDM_ZOOMRESET
+    END
+    POPUP "&Help"
+    BEGIN
+        MENUITEM "&About",                     IDM_ABOUT
+    END
+END
+
+IDD_URL DIALOGEX 0, 0, 280, 62
+STYLE DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Open URL"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Address of a Markdown file (e.g. a GitHub README):", -1, 8, 8, 264, 10
+    EDITTEXT        IDC_URL, 8, 21, 264, 14, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "Open", IDOK, 168, 42, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 222, 42, 50, 14
+END
